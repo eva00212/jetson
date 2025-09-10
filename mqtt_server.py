@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-# jetson_request_loop_dataonly.py
-# - 젯슨: 각 노드에 시간(settime, epoch) 내려주기 → 5초마다 sample 요청
-# - 데이터 토픽만 구독해 표준 JSON 수신/표시 + JSONL 파일 저장(일별 회전)
+# 젯슨: setmap(retain) → settime(retain, 웜업 재전송) → 주기 샘플
+# 데이터 토픽만 구독 + JSONL 저장(일별 회전)
 
 import json, time, signal, uuid, os
 from datetime import datetime, timezone, timedelta
 import paho.mqtt.client as mqtt
 
-# ========= 필수 설정 (네 환경으로 수정) =========
-BROKER = "192.168.10.1"     # 젯슨 AP IP
+# ===== 설정 =====
+BROKER = "192.168.10.1"
 PORT   = 1883
-PERIOD_SEC = 5              # sample 주기(초)
-TIME_SYNC_SEC = 600         # settime 재동기화 주기(초, 10분)
+PERIOD_SEC = 5               # 샘플 주기
+TIME_SYNC_SEC = 600          # 정기 settime 간격(초)
+WARMUP_SEC = 30              # 시작 후 웜업 기간(초)
+WARMUP_SETTIME_INTERVAL = 2  # 웜업 중 settime 재전송 간격(초)
 
-# 노드/토픽 정의 (node1/node2 필요에 맞게 수정/추가)
 NODES = {
     "node1": {
         "cmd":    "barn/node/node1/cmd",
@@ -29,21 +29,20 @@ NODES = {
     }
 }
 
-# ========= 저장 설정 =========
-DATA_DIR = "data"           # 저장 폴더
-ROTATE_DAILY = True         # True면 data/YYYY-MM-DD.jsonl 로 저장
-BASENAME = "data.jsonl"     # ROTATE_DAILY=False일 때 파일명
+# 저장 설정
+DATA_DIR = "data"
+ROTATE_DAILY = True
+BASENAME = "data.jsonl"
+QOS = 1
 
-QOS = 1                     # 구독/퍼블리시 QoS (브로커/클라에 따라 조정)
-
-# ========= 파일 저장 유틸 =========
+# ===== 저장 유틸 =====
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 def data_filepath():
+    kst = timezone(timedelta(hours=9))
     if ROTATE_DAILY:
-        KST = timezone(timedelta(hours=9))
-        today = datetime.now(KST).strftime("%Y-%m-%d")
+        today = datetime.now(kst).strftime("%Y-%m-%d")
         return os.path.join(DATA_DIR, f"{today}.jsonl")
     return os.path.join(DATA_DIR, BASENAME)
 
@@ -52,7 +51,7 @@ def append_jsonl(obj: dict):
     with open(data_filepath(), "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False, separators=(',', ':')) + "\n")
 
-# ========= MQTT =========
+# ===== MQTT =====
 cli = mqtt.Client(client_id="jetson_dataonly")
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -61,7 +60,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     for conf in NODES.values():
         subs.append((conf["temp_t"], QOS))
         subs.append((conf["humi_t"], QOS))
-        # 디버깅할 땐 응답도 보고 싶으면 주석 해제:
+        # 디버깅 원하면 응답도:
         # subs.append((conf["rsp"] + "/#", QOS))
     if subs:
         client.subscribe(subs)
@@ -76,15 +75,14 @@ def on_message(client, userdata, msg):
 
         print(f"[DATA] {msg.topic} -> {payload}")
 
-        # 수신시각도 보조로 기록
-        KST = timezone(timedelta(hours=9))
+        kst = timezone(timedelta(hours=9))
         stored = {
             "device_id": obj["device_id"],
             "type": obj["type"],
             "value": obj["value"],
             "unit": obj["unit"],
-            "timestamp": obj["timestamp"],                     # 노드가 찍은 시각
-            "received_at": datetime.now(KST).isoformat(timespec="seconds")
+            "timestamp": obj["timestamp"],                         # 노드 시각
+            "received_at": datetime.now(kst).isoformat(timespec="seconds")
         }
         append_jsonl(stored)
 
@@ -97,29 +95,26 @@ cli.on_message = on_message
 def pub(topic: str, obj: dict, retain=False, qos=QOS):
     cli.publish(topic, json.dumps(obj, ensure_ascii=False, separators=(',',':')), qos=qos, retain=retain)
 
-# 초기 매핑(retain)
 def send_setmap_all():
     for node, conf in NODES.items():
-        payload = {"action": "setmap", "map": {"temp": conf["temp_t"], "hum": conf["humi_t"]}}
+        payload = {"action":"setmap","map":{"temp":conf["temp_t"],"hum":conf["humi_t"]}}
         print(f"[SETMAP] {node} -> {payload}")
         pub(conf["cmd"], payload, retain=True)
 
-# 시간 동기화: 젯슨의 현재 UTC epoch 초 하달
-def send_settime_all():
-    epoch = int(time.time())
+def send_settime_all(retain=True):
+    epoch = int(time.time())  # UTC epoch
     for node, conf in NODES.items():
-        payload = {"action": "settime", "epoch": epoch}
-        print(f"[SETTIME] {node} -> {payload}")
-        pub(conf["cmd"], payload, retain=False)
+        payload = {"action":"settime","epoch":epoch}
+        print(f"[SETTIME] {node} -> {payload} (retain={retain})")
+        pub(conf["cmd"], payload, retain=retain)
 
-# 샘플 요청
 def send_sample(node_name: str):
     conf = NODES[node_name]
     req_id = f"req-{uuid.uuid4().hex[:8]}"
     payload = {
-        "action": "sample",
-        "types": ["temperature","humidity"],
-        "publish_to": [conf["temp_t"], conf["humi_t"]],
+        "action":"sample",
+        "types":["temperature","humidity"],
+        "publish_to":[conf["temp_t"], conf["humi_t"]],
         "reply_to": conf["rsp"],
         "request_id": req_id
     }
@@ -127,7 +122,7 @@ def send_sample(node_name: str):
     pub(conf["cmd"], payload, retain=False)
     return req_id
 
-# 메인 루프
+# ===== 메인 =====
 _running = True
 def _stop(*_):
     global _running
@@ -141,22 +136,34 @@ def main():
 
     time.sleep(0.3)
     send_setmap_all()
-    send_settime_all()  # 시작 1회 동기화
+    send_settime_all(retain=True)  # 시작 즉시 1회(보존)
 
-    print(f"[RUN] sampling every {PERIOD_SEC}s; time sync every {TIME_SYNC_SEC}s.")
-    next_sample = time.time()
+    start = time.time()
+    next_sample = time.time() + PERIOD_SEC
     next_timesync = time.time() + TIME_SYNC_SEC
+    next_warmup = start  # 웜업 중 2초 간격으로 재전송
 
+    print(f"[RUN] sample={PERIOD_SEC}s, time_sync={TIME_SYNC_SEC}s, warmup={WARMUP_SEC}s")
     try:
         while _running:
             now = time.time()
+
+            # 웜업: 초기 WARMUP_SEC 동안 2초마다 settime 재전송
+            if now - start <= WARMUP_SEC and now >= next_warmup:
+                send_settime_all(retain=True)
+                next_warmup = now + WARMUP_SETTIME_INTERVAL
+
+            # 정기 time sync
+            if now >= next_timesync:
+                send_settime_all(retain=True)
+                next_timesync = now + TIME_SYNC_SEC
+
+            # 주기 샘플
             if now >= next_sample:
                 for node in NODES.keys():
                     send_sample(node)
                 next_sample = now + PERIOD_SEC
-            if now >= next_timesync:
-                send_settime_all()
-                next_timesync = now + TIME_SYNC_SEC
+
             time.sleep(0.05)
     finally:
         print("[STOP] closing...")
