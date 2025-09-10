@@ -7,19 +7,13 @@ import json, time, signal, uuid, os
 from datetime import datetime, timezone, timedelta
 import paho.mqtt.client as mqtt
 
-# ========= 환경 설정 =========
-BROKER = "192.168.4.1"
+# ========= 필수 설정 (네 환경으로 수정) =========
+BROKER = "192.168.10.1"     # 젯슨 AP IP
 PORT   = 1883
-QOS    = 1
-PERIOD_SEC = 5              # sample 주기
-TIME_SYNC_SEC = 600         # 시간 동기화 주기(예: 10분마다)
+PERIOD_SEC = 5              # sample 주기(초)
+TIME_SYNC_SEC = 600         # settime 재동기화 주기(초, 10분)
 
-# 저장 설정
-DATA_DIR = "/home/user/data"
-ROTATE_DAILY = True
-BASENAME = "data.jsonl"
-
-# 노드/토픽 정의
+# 노드/토픽 정의 (node1/node2 필요에 맞게 수정/추가)
 NODES = {
     "node1": {
         "cmd":    "barn/node/node1/cmd",
@@ -35,22 +29,27 @@ NODES = {
     }
 }
 
-# ========= 유틸: 파일 저장 =========
+# ========= 저장 설정 =========
+DATA_DIR = "data"           # 저장 폴더
+ROTATE_DAILY = True         # True면 data/YYYY-MM-DD.jsonl 로 저장
+BASENAME = "data.jsonl"     # ROTATE_DAILY=False일 때 파일명
+
+QOS = 1                     # 구독/퍼블리시 QoS (브로커/클라에 따라 조정)
+
+# ========= 파일 저장 유틸 =========
 def ensure_data_dir():
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 def data_filepath():
     if ROTATE_DAILY:
-        today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+        KST = timezone(timedelta(hours=9))
+        today = datetime.now(KST).strftime("%Y-%m-%d")
         return os.path.join(DATA_DIR, f"{today}.jsonl")
-    else:
-        return os.path.join(DATA_DIR, BASENAME)
+    return os.path.join(DATA_DIR, BASENAME)
 
 def append_jsonl(obj: dict):
     ensure_data_dir()
-    fp = data_filepath()
-    with open(fp, "a", encoding="utf-8") as f:
+    with open(data_filepath(), "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False, separators=(',', ':')) + "\n")
 
 # ========= MQTT =========
@@ -62,9 +61,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
     for conf in NODES.values():
         subs.append((conf["temp_t"], QOS))
         subs.append((conf["humi_t"], QOS))
-        # 디버깅 필요하면 rsp도 잠시 구독:
+        # 디버깅할 땐 응답도 보고 싶으면 주석 해제:
         # subs.append((conf["rsp"] + "/#", QOS))
-    client.subscribe(subs)
+    if subs:
+        client.subscribe(subs)
 
 def on_message(client, userdata, msg):
     payload = msg.payload.decode("utf-8")
@@ -76,17 +76,18 @@ def on_message(client, userdata, msg):
 
         print(f"[DATA] {msg.topic} -> {payload}")
 
-        # 수신 시각도 같이 남겨두면 분석에 좋아요
+        # 수신시각도 보조로 기록
         KST = timezone(timedelta(hours=9))
         stored = {
             "device_id": obj["device_id"],
             "type": obj["type"],
             "value": obj["value"],
             "unit": obj["unit"],
-            "timestamp": obj["timestamp"],                     # 노드가 보낸 시각(젯슨이 내려준 시간 기반)
+            "timestamp": obj["timestamp"],                     # 노드가 찍은 시각
             "received_at": datetime.now(KST).isoformat(timespec="seconds")
         }
         append_jsonl(stored)
+
     except Exception as e:
         print(f"[WARN] non-conforming payload on {msg.topic}: {e} :: {payload}")
 
@@ -96,22 +97,22 @@ cli.on_message = on_message
 def pub(topic: str, obj: dict, retain=False, qos=QOS):
     cli.publish(topic, json.dumps(obj, ensure_ascii=False, separators=(',',':')), qos=qos, retain=retain)
 
-# ======== 초기 매핑: 데이터 토픽만 지정(retain) ========
+# 초기 매핑(retain)
 def send_setmap_all():
     for node, conf in NODES.items():
         payload = {"action": "setmap", "map": {"temp": conf["temp_t"], "hum": conf["humi_t"]}}
         print(f"[SETMAP] {node} -> {payload}")
         pub(conf["cmd"], payload, retain=True)
 
-# ======== 시간 동기화: 젯슨 시간을 epoch(UTC)로 하달 ========
+# 시간 동기화: 젯슨의 현재 UTC epoch 초 하달
 def send_settime_all():
-    epoch = int(time.time())  # UTC epoch seconds
+    epoch = int(time.time())
     for node, conf in NODES.items():
         payload = {"action": "settime", "epoch": epoch}
         print(f"[SETTIME] {node} -> {payload}")
         pub(conf["cmd"], payload, retain=False)
 
-# ======== 1회 요청: 데이터 토픽으로만 발행하도록 sample ========
+# 샘플 요청
 def send_sample(node_name: str):
     conf = NODES[node_name]
     req_id = f"req-{uuid.uuid4().hex[:8]}"
@@ -126,7 +127,7 @@ def send_sample(node_name: str):
     pub(conf["cmd"], payload, retain=False)
     return req_id
 
-# ======== 메인 루프 ========
+# 메인 루프
 _running = True
 def _stop(*_):
     global _running
@@ -140,22 +141,22 @@ def main():
 
     time.sleep(0.3)
     send_setmap_all()
-    send_settime_all()                       # ⭐ 부팅 직후 1회 시간 동기화
+    send_settime_all()  # 시작 1회 동기화
 
     print(f"[RUN] sampling every {PERIOD_SEC}s; time sync every {TIME_SYNC_SEC}s.")
-    next_tick = time.time()
-    next_time_sync = time.time() + TIME_SYNC_SEC
+    next_sample = time.time()
+    next_timesync = time.time() + TIME_SYNC_SEC
 
     try:
         while _running:
             now = time.time()
-            if now >= next_tick:
+            if now >= next_sample:
                 for node in NODES.keys():
                     send_sample(node)
-                next_tick = now + PERIOD_SEC
-            if now >= next_time_sync:
-                send_settime_all()           # ⭐ 주기적 시간 재동기화
-                next_time_sync = now + TIME_SYNC_SEC
+                next_sample = now + PERIOD_SEC
+            if now >= next_timesync:
+                send_settime_all()
+                next_timesync = now + TIME_SYNC_SEC
             time.sleep(0.05)
     finally:
         print("[STOP] closing...")
