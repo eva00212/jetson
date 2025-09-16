@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-5초마다 아두이노에 sample 요청 → RAW 수신 → 계산 → 표준토픽 발행 + 파일저장
-저장 위치: /home/user/sensor_data/YYYY-MM-DD.jsonl
-"""
 
 import os, json, uuid, time, threading
 from datetime import datetime, timezone, timedelta
@@ -11,16 +7,15 @@ import paho.mqtt.client as mqtt
 
 BROKER      = "192.168.4.1"
 CTRL_TOPIC  = "/barn/ctrl/ftm01/cmd"
-ACK_TOPIC   = "/barn/ctrl/ftm01/ack"
 RAW_TOPIC   = "/barn/raw/ftm01/1"
-
+ACK_TOPIC   = "/barn/ctrl/ftm01/ack"
 TOPIC_TEMP  = "/barn/sensor/temp001/data"
 TOPIC_HUM   = "/barn/sensor/hum001/data"
 
 SAVE_DIR    = "/home/user/sensor_data"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-POLL_SEC    = 5  # 5초마다 요청
+POLL_SEC = 5
 
 _cur_date=None; _cur_path=None
 def kst_now(): return datetime.now(timezone(timedelta(hours=9)))
@@ -28,29 +23,32 @@ def path_today():
     global _cur_date, _cur_path
     today = kst_now().strftime("%Y-%m-%d")
     if today != _cur_date:
-        _cur_date=today
-        _cur_path=os.path.join(SAVE_DIR, f"{today}.jsonl")
+        _cur_date = today
+        _cur_path = os.path.join(SAVE_DIR, f"{today}.jsonl")
         if not os.path.exists(_cur_path):
             open(_cur_path,"w").close()
             print(f"[INFO] 📁 새 파일 생성: {_cur_path}")
     return _cur_path
 
 c = mqtt.Client(protocol=mqtt.MQTTv311)
+connected_flag = False   # ← 연결상태 플래그
 
 def publish_standard(device_id, typ, value, unit, ts_iso):
     rec = {"Device_id": device_id, "Type": typ, "Value": value, "Unit": unit, "Timestamp": ts_iso}
     payload = json.dumps(rec, ensure_ascii=False)
     topic = TOPIC_TEMP if typ=="temperature" else TOPIC_HUM
     c.publish(topic, payload, qos=1)
-    with open(path_today(),"a",encoding="utf-8") as f:
+    with open(path_today(), "a", encoding="utf-8") as f:
         f.write(payload+"\n")
 
 def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("✅ MQTT connected")
+    global connected_flag
+    if rc == 0 and not connected_flag:
+        connected_flag = True
+        print("✅ MQTT 브로커에 연결되었습니다!")
         print(f"[INFO] 저장 위치: {SAVE_DIR}")
-    else:
-        print(f"⚠️ MQTT 연결 실패 rc={rc}")
+    elif rc != 0:
+        print(f"⚠️ MQTT 연결 실패 (rc={rc})")
     client.subscribe(RAW_TOPIC, qos=1)
     client.subscribe(ACK_TOPIC, qos=1)
 
@@ -59,10 +57,10 @@ def on_message(client, userdata, msg):
         try:
             raw = json.loads(msg.payload.decode("utf-8"))
         except:
-            print("⚠️ RAW 메시지 JSON 파싱 실패")
+            print("⚠️ RAW 메시지 파싱 실패")
             return
         if not raw.get("ok"):
-            print("⚠️ RAW 수신 실패 (ok=false)")
+            print("⚠️ RAW 수신 실패")
             return
 
         hum_raw  = raw.get("hum_raw")
