@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-jetson_request_and_store.py  (MQTT v3.1.1)
-- 5초마다 /barn/ctrl/ftm01/cmd 로 {"cmd":"sample","corr":...} 요청
-- /barn/raw/ftm01/1 수신 → 값 ÷10 → 표준 토픽 발행 + /home/user/sensor_data/YYYY-MM-DD.jsonl 저장
+5초마다 아두이노에 sample 요청 → RAW 수신 → 계산 → 표준토픽 발행 + 파일저장
+저장 위치: /home/user/sensor_data/YYYY-MM-DD.jsonl
 """
 
 import os, json, uuid, time, threading
@@ -21,9 +20,8 @@ TOPIC_HUM   = "/barn/sensor/hum001/data"
 SAVE_DIR    = "/home/user/sensor_data"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-POLL_SEC    = 5  # 5초마다 샘플 요청
+POLL_SEC    = 5  # 5초마다 요청
 
-# ---- 파일 경로 (KST 날짜별) ----
 _cur_date=None; _cur_path=None
 def kst_now(): return datetime.now(timezone(timedelta(hours=9)))
 def path_today():
@@ -34,10 +32,9 @@ def path_today():
         _cur_path=os.path.join(SAVE_DIR, f"{today}.jsonl")
         if not os.path.exists(_cur_path):
             open(_cur_path,"w").close()
-            print("[INFO] New file:", _cur_path)
+            print(f"[INFO] 📁 새 파일 생성: {_cur_path}")
     return _cur_path
 
-# ---- MQTT (v3.1.1) ----
 c = mqtt.Client(protocol=mqtt.MQTTv311)
 
 def publish_standard(device_id, typ, value, unit, ts_iso):
@@ -49,19 +46,25 @@ def publish_standard(device_id, typ, value, unit, ts_iso):
         f.write(payload+"\n")
 
 def on_connect(client, userdata, flags, rc):
-    print("[MQTT] connected:", rc)
+    if rc == 0:
+        print("✅ MQTT connected")
+        print(f"[INFO] 저장 위치: {SAVE_DIR}")
+    else:
+        print(f"⚠️ MQTT 연결 실패 rc={rc}")
     client.subscribe(RAW_TOPIC, qos=1)
     client.subscribe(ACK_TOPIC, qos=1)
 
 def on_message(client, userdata, msg):
-    t = msg.topic
-    if t == RAW_TOPIC:
+    if msg.topic == RAW_TOPIC:
         try:
             raw = json.loads(msg.payload.decode("utf-8"))
         except:
+            print("⚠️ RAW 메시지 JSON 파싱 실패")
             return
-        if not raw.get("ok"):   # 읽기 실패면 스킵
+        if not raw.get("ok"):
+            print("⚠️ RAW 수신 실패 (ok=false)")
             return
+
         hum_raw  = raw.get("hum_raw")
         temp_raw = raw.get("temp_raw")
         ts_iso   = raw.get("ts") or datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -73,16 +76,14 @@ def on_message(client, userdata, msg):
             temp = float(temp_raw)/10.0
             publish_standard("temp001","temperature", temp, "C", ts_iso)
 
-    elif t == ACK_TOPIC:
-        # 필요하면 corr 매칭/로그 추가
-        pass
+        print(f"📥 RAW 수신 → 저장 완료 | 온도={temp_raw/10.0}°C 습도={hum_raw/10.0}%")
 
 def request_loop():
     while True:
         corr = uuid.uuid4().hex[:8]
         msg = {"cmd":"sample","corr":corr,"args":{}}
         c.publish(CTRL_TOPIC, json.dumps(msg, ensure_ascii=False), qos=1)
-        # print("[TX]", CTRL_TOPIC, msg)
+        print(f"📤 sample 요청 전송 (corr={corr})")
         time.sleep(POLL_SEC)
 
 if __name__=="__main__":
@@ -90,10 +91,6 @@ if __name__=="__main__":
     c.on_message = on_message
     c.connect(BROKER, 1883, 30)
 
-    # RAW 저장 경로 안내
-    print("[INFO] Writing to:", SAVE_DIR)
-
-    # 요청 스레드 시작(5초마다 sample 요청)
     th = threading.Thread(target=request_loop, daemon=True)
     th.start()
 
